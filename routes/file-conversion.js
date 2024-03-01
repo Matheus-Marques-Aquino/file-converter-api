@@ -2,8 +2,10 @@ const express = require("express");
 const router = express.Router();
 const dotenv = require('dotenv');
 const axios = require("axios");
+const FormData = require('form-data');
 
 const { exec } = require('child_process');
+
 const path = require('path');
 
 const fs = require('fs');
@@ -52,49 +54,200 @@ function generateRandomHash() {
     return hash.toUpperCase();
 }
 
+async function cloneFile(filePath, copyPath) {
+    return await new Promise((resolve, reject) => {
+        fs.readFile(filePath, (err, data) => {        
+            if (err) {
+                console.error('Erro ao ler o arquivo original:', err);
+                reject(false);
+                return;
+            }
+
+            fs.writeFile(copyPath, data, (err) => {
+                if (err) {
+                    console.error('Erro ao escrever o arquivo duplicado:', err);
+                    reject(false);
+                    return;
+                }
+                
+                resolve(true);
+                console.log('Arquivo duplicado com sucesso.');
+            });
+        }); 
+    });
+}
+
+router.post('/send-file', async (req, res) => {
+    const formData = new FormData();
+
+    var fileName = 'documento_editado.docx';
+
+    var error = false;
+    var result = null;
+
+    var convertTo = 'pdf';
+
+    var filePath = path.resolve('public', fileName);
+    var fileCopy = path.resolve('public', '_' + fileName);
+
+    try{
+        let success = await cloneFile(filePath, fileCopy);
+
+        if (success){
+            filePath = fileCopy;
+        }
+    }catch(e){
+        error = e;
+        console.error('Erro ao clonar arquivo:', e);
+    }
+
+    const fileStream = fs.createReadStream(filePath);
+
+    formData.append('arquivo', fileStream);
+
+    const regex = /(?:\\|\/)([^\\\/]+)\.([^\\\/.]+)$/;
+    const match = filePath.match(regex);  
+
+    try {
+        await axios.post('http://localhost:3051/file-conversion?convertTo=' + convertTo, formData, {
+            responseType: 'arraybuffer', // Isso garante que a resposta seja tratada como um buffer binário
+          })
+            .then((response) => {
+                let { data } = { ...response };
+
+                if (data) {
+                    let filename = fileName;
+                    
+                    if (match != null && match[1]) {
+                        filename = match[1] + '.' + convertTo;
+                    }
+                    
+                    let _path = path.resolve('public', filename);
+
+                    fs.writeFile(_path, data, 'binary', (err) => {
+                        if (err) {
+                            console.error('Erro ao salvar o arquivo:', err);
+                            return;
+                        }
+                        console.log('Arquivo salvo com sucesso:', _path);
+                    });
+
+                    fs.unlink(fileCopy, (err) => {
+                        if (err) { 
+                            console.error('Erro ao excluir o arquivo:', err); 
+                        }
+                    });
+
+                    //console.log('Arquivo salvo com sucesso:', _path);                    
+                } else {
+                    console.error('Resposta vazia ou sem dados de arquivo.');
+                }
+            })
+            .catch((err) => {
+                error = err;
+
+                if (error && error.response) {
+                    error = error.response;
+                }
+
+                if (error && error.data) {
+                    error = error.data;
+                }   
+
+                console.error('Erro ao enviar arquivo:', error);
+            });        
+    } catch (err) {
+        error = err;
+        console.error('Erro ao enviar arquivo:', err);
+    }
+
+    if (error) {
+        return res.status(400).json({ error });
+    }
+
+    return res.status(200).json({ error: false });
+});
+
 router.post("/", async (req, res) => {
-    const body = { ...req.body };
+    const files = { ...req.files };
+    const query = { ...req.query };
+
+    var { convertTo } = query;
+
+    if (!files || !files.arquivo) {
+        return res.status(400).json({
+            error: true,
+            message: 'File not found.'
+        });
+    }
+
+    if (!convertTo || typeof convertTo != 'string') {
+        return res.status(400).json({
+            error: true,
+            message: 'Invalid extension to convert.'
+        });
+    }
+
+    convertTo = convertTo.toLowerCase().trim();
+
+    if (!validExtensions.includes(convertTo) ) {
+        return res.status(400).json({
+            error: true,
+            message: 'Invalid extension to convert.'
+        });
+    }
+
     var error = null;
-
-    var {
-        fileBase64,
-        fileName,
-        convertTo
-    } = body;
-
-    if (typeof convertTo == 'string') {
-        convertTo = convertTo.toLowerCase().trim();
-    }
-
-    if ( !convertTo || !validExtensions.includes(convertTo) ) {
-        return res.status(400).json({ error: "Extensão de conversão inválida!" });
-    }
+    var uploadedFile = { ...files.arquivo };
+    
 
     var randomHash = generateRandomHash() + '_';
+    var fileName = randomHash + uploadedFile.name;
+    
     var filePath = null;
 
     try {
-        const decoded = Buffer.from(fileBase64, 'base64');    
-        filePath = path.resolve('public', randomHash + fileName);
+        filePath = path.resolve('public', fileName);
+        rootFile = path.resolve('public', fileName);
+        
+        await new Promise(async (resolve, reject) => {
+            await uploadedFile.mv(filePath, async (err) => {
+                if (err) {
+                    console.error('Error while saving file:', err);
 
-        if (!filePath) {
-            error = 'Erro ao salvar o arquivo!';
-            return;
-        }
+                    error = {
+                        status: 500,
+                        message: 'Internal server error while saving file.'
+                    };
 
-        fs.writeFileSync(filePath, decoded);        
-    } catch(e) {
-        error = e;
-        console.error('Erro ao receber o arquivo:', e);
+                    reject(error);
+                    return;
+                }
+
+                console.log('File uploaded successfully.', filePath)
+                resolve(filePath);
+            });
+        });
+
+    }catch(err){
+        console.error('Error while processing request:', err);
+
+        error = {
+            status: 500,
+            message: 'Internal server error.'
+        };
     }
 
-    if (error) {        
-        return res.status(400).json({ error });
+    if (error) {
+        return res.status(error.status || 400).json({
+            error: true,
+            message: error.message || 'Internal server error.'
+        });
     }
 
     var outPath = path.resolve('public');   
 
-    const command = `soffice --convert-to ${convertTo} "${filePath}" --outdir "${outPath}"`;
+    const command = `soffice --headless --convert-to ${convertTo} "${filePath}" --outdir "${outPath}"`;
 
     try {
         await new Promise((resolve, reject) => {
@@ -133,30 +286,54 @@ router.post("/", async (req, res) => {
             fileName = match[1] + '.' + convertTo;
             outPath = path.resolve('public', fileName);
         }else{
-            error = 'Erro ao obter o nome do arquivo convertido!';
+            error = {
+                status: 400,
+                message: 'Error while converting file.'
+            };
+
             return;
         }
-        
-        fileBase64 = fs.readFileSync(outPath, { encoding: 'base64' });
-        fs.unlinkSync(outPath);
-        fs.unlinkSync(filePath);
 
         if (typeof fileName == 'string') {
             fileName = fileName.slice(11);
         }
+
+        res.sendFile(outPath, (err) => {
+            if (err) {
+                console.error('Erro ao enviar o arquivo:', err);
+                
+                res.status(500).send({
+                    error: true, 
+                    message: 'Error while sending converted file.'
+                });
+            } else {
+                try {
+                    fs.unlink(filePath, (err) => {
+                        if (err) { console.error('Erro ao excluir o arquivo:', err); }
+                    });
+
+                    fs.unlink(outPath, (err) => {
+                        if (err) { console.error('Erro ao excluir o arquivo:', err); }
+                    });
+                }catch(e){
+                    error = e;
+                    console.error('Erro desconhecido:', e);
+                }
+
+                console.log('File send successfully.', outPath);
+            }
+        });
     }catch(e){
         error = e;
         console.error('Erro ao enviar o arquivo:', e);
     }
 
     if (error) {
-        return res.status(400).json({ error });
+        return res.status(error.status || 400).json({ 
+            error: true, 
+            message: error.message || 'Error while converting file.'
+        });
     }
-
-    return res.status(200).json({
-        fileBase64,
-        fileName
-    });
 });
 
 router.post("/test-route", async (req, res) => {
